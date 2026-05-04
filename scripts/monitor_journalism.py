@@ -13,6 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,8 @@ DOCS_DIR = PROJECT_ROOT / "docs"
 DOCS_REPORTS_DIR = DOCS_DIR / "reports"
 
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
+GOOGLE_NEWS_RSS_ENDPOINT = "https://news.google.com/rss/search"
+OPENALEX_ENDPOINT = "https://api.openalex.org/works"
 QUERY = (
     '("generative AI" OR ChatGPT OR "artificial intelligence" OR '
     '"inteligencia artificial" OR "IA generativa") '
@@ -89,6 +92,12 @@ NEWS_SOURCE_DOMAINS = {
     "elpais.com.uy": "El Pais Uruguay",
     "abc.com.py": "ABC Color",
     "nacion.com": "La Nacion Costa Rica",
+    "infobae.com": "Infobae",
+    "latamjournalismreview.org": "LatAm Journalism Review",
+    "fundaciongabo.org": "Fundacion Gabo",
+    "sipiapa.org": "Sociedad Interamericana de Prensa",
+    "ijnet.org": "IJNet",
+    "knightcenter.utexas.edu": "Knight Center",
 }
 
 OFFICIAL_SOURCE_DOMAINS = {
@@ -100,7 +109,21 @@ OFFICIAL_SOURCE_DOMAINS = {
     "governor.ny.gov": "Gobernacion de Nueva York",
 }
 
-SOURCE_LABELS = NEWS_SOURCE_DOMAINS | OFFICIAL_SOURCE_DOMAINS
+ACADEMIC_SOURCE_DOMAINS = {
+    "openalex.org": "OpenAlex / literatura academica",
+    "doi.org": "DOI / articulo academico",
+    "arxiv.org": "arXiv",
+    "scielo.org": "SciELO",
+    "redalyc.org": "Redalyc",
+    "unesco.org": "UNESCO",
+    "reutersinstitute.politics.ox.ac.uk": "Reuters Institute",
+    "niemanlab.org": "NiemanLab",
+    "journalismai.info": "JournalismAI",
+    "towcenter.columbia.edu": "Tow Center",
+    "digitalnewsreport.org": "Digital News Report",
+}
+
+SOURCE_LABELS = NEWS_SOURCE_DOMAINS | OFFICIAL_SOURCE_DOMAINS | ACADEMIC_SOURCE_DOMAINS
 
 LATIN_AMERICA_COUNTRIES = {
     "America Latina / regional",
@@ -133,6 +156,20 @@ class Article:
     source_country: str
     language: str
     seen_date: str
+
+
+def normalize_domain(value: str) -> str:
+    parsed = urllib.parse.urlparse(value if "://" in value else f"https://{value}")
+    return parsed.netloc.lower().removeprefix("www.")
+
+
+def clean_text(value: str) -> str:
+    if "Ã" not in value and "Â" not in value:
+        return value
+    try:
+        return value.encode("latin1").decode("utf-8")
+    except UnicodeError:
+        return value
 
 
 def fetch_gdelt_articles(max_records: int = 50, timespan: str = "3d", retries: int = 3) -> list[Article]:
@@ -168,12 +205,18 @@ def fetch_gdelt_articles(max_records: int = 50, timespan: str = "3d", retries: i
                 print("WARNING: GDELT rate limit reached; generating an empty report.", file=sys.stderr)
                 return []
             raise
+        except urllib.error.URLError as exc:
+            if attempt < retries:
+                time.sleep(5 * attempt)
+                continue
+            print(f"WARNING: GDELT request failed: {exc}; continuing with fallback sources.", file=sys.stderr)
+            return []
 
     articles = []
     for item in payload.get("articles", []):
         articles.append(
             Article(
-                title=str(item.get("title", "")).strip(),
+                title=clean_text(str(item.get("title", "")).strip()),
                 url=str(item.get("url", "")).strip(),
                 domain=str(item.get("domain", "")).strip().lower(),
                 source_country=str(item.get("sourcecountry", "")).strip(),
@@ -184,11 +227,117 @@ def fetch_gdelt_articles(max_records: int = 50, timespan: str = "3d", retries: i
     return [article for article in articles if article.title and article.url]
 
 
+def fetch_google_news_articles(max_records: int = 30) -> list[Article]:
+    queries = [
+        '"inteligencia artificial" periodismo "America Latina"',
+        '"IA generativa" periodismo medios',
+        '"generative AI" journalism "Latin America"',
+        'ChatGPT periodismo redacciones medios',
+    ]
+    articles: list[Article] = []
+    for query in queries:
+        params = {
+            "q": query,
+            "hl": "es-419",
+            "gl": "US",
+            "ceid": "US:es-419",
+        }
+        url = GOOGLE_NEWS_RSS_ENDPOINT + "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "journalism-monitoring-pipeline/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            root = ET.fromstring(response.read())
+        for item in root.findall("./channel/item"):
+            title = clean_text((item.findtext("title") or "").strip())
+            link = (item.findtext("link") or "").strip()
+            source = item.find("source")
+            source_url = source.attrib.get("url", "") if source is not None else ""
+            domain = normalize_domain(source_url or link)
+            seen_date = (item.findtext("pubDate") or "").strip()
+            if title and link and domain:
+                articles.append(
+                    Article(
+                        title=title,
+                        url=link,
+                        domain=domain,
+                        source_country="",
+                        language="",
+                        seen_date=seen_date,
+                    )
+                )
+            if len(articles) >= max_records:
+                return articles
+    return articles
+
+
+def fetch_openalex_works(max_records: int = 20) -> list[Article]:
+    queries = [
+        "generative AI journalism Latin America",
+        "artificial intelligence journalism Latin America",
+        "AI newsrooms journalism",
+        "inteligencia artificial periodismo America Latina",
+    ]
+    articles: list[Article] = []
+    for query in queries:
+        params = {
+            "search": query,
+            "filter": "from_publication_date:2020-01-01",
+            "per-page": "10",
+            "sort": "publication_date:desc",
+        }
+        url = OPENALEX_ENDPOINT + "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "journalism-monitoring-pipeline/1.0"},
+        )
+        with urllib.request.urlopen(request, timeout=45) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        for item in payload.get("results", []):
+            title = clean_text(str(item.get("title") or "").strip())
+            doi = str(item.get("doi") or "").strip()
+            work_url = str(item.get("id") or "").strip()
+            url_value = doi or work_url
+            publication_date = str(item.get("publication_date") or "").strip()
+            if title and url_value:
+                articles.append(
+                    Article(
+                        title=title,
+                        url=url_value,
+                        domain=normalize_domain(url_value or "openalex.org"),
+                        source_country="",
+                        language="",
+                        seen_date=publication_date,
+                    )
+                )
+            if len(articles) >= max_records:
+                return articles
+    return articles
+
+
+def fetch_articles() -> list[Article]:
+    articles: list[Article] = []
+    gdelt_articles = fetch_gdelt_articles(max_records=50, timespan="7d")
+    articles.extend(gdelt_articles)
+    try:
+        articles.extend(fetch_google_news_articles())
+    except Exception as exc:
+        print(f"WARNING: Google News RSS fallback failed: {exc}", file=sys.stderr)
+    try:
+        articles.extend(fetch_openalex_works())
+    except Exception as exc:
+        print(f"WARNING: OpenAlex academic fallback failed: {exc}", file=sys.stderr)
+    return articles
+
+
 def score_article(article: Article) -> int:
     text = f"{article.title} {article.domain}".lower()
     score = 0
     if article.domain in NEWS_SOURCE_DOMAINS:
         score += 40
+    if article.domain in ACADEMIC_SOURCE_DOMAINS:
+        score += 35
     for term in ("generative ai", "artificial intelligence", "inteligencia artificial", "ia generativa", "chatgpt"):
         if term in text:
             score += 12
@@ -202,20 +351,22 @@ def score_article(article: Article) -> int:
 
 
 def is_identifiable_news_source(article: Article) -> bool:
-    return article.domain in NEWS_SOURCE_DOMAINS
+    return article.domain in NEWS_SOURCE_DOMAINS or article.domain in ACADEMIC_SOURCE_DOMAINS
 
 
 def is_latin_america_relevant(article: Article) -> bool:
-    return infer_country(article) in LATIN_AMERICA_COUNTRIES
+    text = f"{article.title} {article.domain}".lower()
+    regional_terms = ("latin america", "america latina", "américa latina", "latam", "latinoamerica")
+    return infer_country(article) in LATIN_AMERICA_COUNTRIES or any(term in text for term in regional_terms)
 
 
 def select_articles(articles: list[Article], limit: int = 12) -> list[Article]:
     seen_urls: set[str] = set()
     deduped: list[Article] = []
-    news_articles = [
-        article for article in articles if is_identifiable_news_source(article) and is_latin_america_relevant(article)
-    ]
-    for article in sorted(news_articles, key=score_article, reverse=True):
+    news_articles = [article for article in articles if is_identifiable_news_source(article)]
+    regional_articles = [article for article in news_articles if is_latin_america_relevant(article)]
+    candidate_articles = regional_articles or news_articles
+    for article in sorted(candidate_articles, key=score_article, reverse=True):
         if article.url in seen_urls:
             continue
         seen_urls.add(article.url)
@@ -232,25 +383,30 @@ def infer_case_fields(article: Article) -> dict[str, str]:
     use_case = "Uso o debate general sobre IA generativa en periodismo"
     risk_or_topic = "Impacto editorial y transformacion profesional"
 
-    if "fact-check" in text or "fact checking" in text or "verificacion" in text or "verificar" in text:
+    if "fact-check" in text or "fact checking" in text or "verificacion" in text or "verificación" in text or "verificar" in text:
         use_case = "Verificacion, fact-checking o apoyo a investigacion"
-    elif "automated" in text or "automation" in text or "automatizacion" in text or "automated journalism" in text:
+    elif "automated" in text or "automation" in text or "automatizacion" in text or "automatización" in text or "automated journalism" in text:
         use_case = "Automatizacion de contenidos o procesos editoriales"
-    elif "training" in text or "capacitacion" in text or "formacion" in text:
+    elif "training" in text or "capacitacion" in text or "capacitación" in text or "formacion" in text or "formación" in text:
         use_case = "Capacitacion o alfabetizacion en IA para periodistas"
+    elif "redaccion" in text or "redacción" in text or "redacciones" in text or "newsroom" in text or "adopcion" in text or "adopción" in text or "transforman" in text:
+        use_case = "Adopcion de IA en redacciones y medios"
     elif "chatgpt" in text or "generative ai" in text or "ia generativa" in text:
         use_case = "Herramientas generativas para produccion periodistica"
 
-    if "ethic" in text or "etica" in text or "transparency" in text or "transparencia" in text:
+    if "ethic" in text or "etica" in text or "ética" in text or "transparency" in text or "transparencia" in text:
         risk_or_topic = "Etica, transparencia y criterios editoriales"
     elif "copyright" in text or "autor" in text or "derechos" in text:
         risk_or_topic = "Derechos de autor y uso de contenidos"
-    elif "misinformation" in text or "disinformation" in text or "desinformacion" in text:
+    elif "misinformation" in text or "disinformation" in text or "desinformacion" in text or "desinformación" in text:
         risk_or_topic = "Desinformacion y confianza publica"
     elif "job" in text or "empleo" in text or "trabajo" in text or "laboral" in text:
         risk_or_topic = "Impacto laboral en periodistas y redacciones"
 
-    if article.domain in NEWS_SOURCE_DOMAINS:
+    if article.domain in ACADEMIC_SOURCE_DOMAINS:
+        actor = SOURCE_LABELS.get(article.domain, "Fuente academica")
+        risk_or_topic = "Investigacion academica y evidencia empirica"
+    elif article.domain in NEWS_SOURCE_DOMAINS:
         actor = SOURCE_LABELS.get(article.domain, actor)
 
     return {
@@ -294,7 +450,7 @@ def infer_country(article: Article) -> str:
     for country, terms in country_terms.items():
         if any(term in text for term in terms):
             return country
-    if "latin america" in text or "america latina" in text or "latinoamerica" in text:
+    if "latin america" in text or "america latina" in text or "américa latina" in text or "latinoamerica" in text or "latam" in text:
         return "America Latina / regional"
     return article.source_country or "No identificado automaticamente"
 
@@ -334,13 +490,13 @@ def build_report(articles: list[Article], run_date: str) -> str:
         "# Monitoreo periodistico: IA generativa en medios de comunicacion",
         "",
         f"Fecha de ejecucion: {run_date}",
-        "Fuente automatizada inicial: GDELT DOC 2.0 API.",
+        "Fuentes automatizadas iniciales: GDELT DOC 2.0 API, Google News RSS y OpenAlex.",
         "Nota metodologica: los resultados automatizados requieren revision editorial antes de publicacion externa.",
         "",
         "## Alcance y verificacion",
         "",
-        "- Datos verificados automaticamente: titulo, enlace, dominio, fecha detectada por GDELT y pais de fuente cuando esta disponible.",
-        "- Filtro de fuentes: solo se incluyen articulos cuyo dominio esta en la lista interna de medios de noticias identificables.",
+        "- Datos verificados automaticamente: titulo, enlace, dominio, fecha detectada por las fuentes automatizadas y pais de fuente cuando esta disponible.",
+        "- Filtro de fuentes: se incluyen medios de noticias identificables y fuentes academicas/research reconocibles.",
         "- Interpretaciones: pais/actor/tipo de uso/tema editorial se infieren desde titulo, dominio y metadatos; requieren revision editorial antes de publicacion externa.",
         "- Incertidumbres: el script no puede confirmar por si solo el texto completo de cada articulo ni reemplaza la verificacion manual con fuentes primarias.",
         "",
@@ -405,7 +561,7 @@ def build_report(articles: list[Article], run_date: str) -> str:
                 "",
                 f"**Resumen en espanol:** {article_summary(article)}",
                 "",
-                "**Datos verificados:** titulo, URL, dominio y fecha detectada por GDELT.",
+                "**Datos verificados:** titulo, URL, dominio y fecha detectada por la fuente automatizada.",
                 "",
                 "**Interpretacion:** clasificacion editorial preliminar generada automaticamente.",
                 "",
@@ -420,6 +576,8 @@ def build_report(articles: list[Article], run_date: str) -> str:
             "",
             "- GDELT DOC 2.0 API: https://api.gdeltproject.org/api/v2/doc/doc",
             "- Documentacion GDELT DOC 2.0: https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/",
+            "- Google News RSS: https://news.google.com/rss",
+            "- OpenAlex Works API: https://docs.openalex.org/api-entities/works",
             "- Fecha de extraccion registrada en este informe.",
         ]
     )
@@ -603,7 +761,7 @@ def run_pipeline() -> int:
     run_date = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
     ensure_styles()
-    articles = select_articles(fetch_gdelt_articles())
+    articles = select_articles(fetch_articles())
     report_text = build_report(articles, run_date)
     report_name = f"monitoreo-ia-periodismo-{run_date}.md"
     report_path = REPORTS_DIR / report_name
